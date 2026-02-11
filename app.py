@@ -1,19 +1,27 @@
 from PyPDF2 import PdfReader
 from datetime import datetime
 import streamlit as st
-import pandas as pd
-import base64, os, shutil
+import os, shutil, time
+import hashlib
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain_classic.chains.question_answering import load_qa_chain
 from langchain_classic.prompts import PromptTemplate
+from langchain_classic.schema import Document
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 
 from langchain_huggingface import HuggingFaceEmbeddings
 
 
+from google.api_core.exceptions import ResourceExhausted
+
+
 VECTOR_DB = "faiss_index"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+SIMILARITY_SCORE_THRESHOLD = 0.5
 
 
 def get_pdf_text(pdfs):
@@ -25,23 +33,27 @@ def get_pdf_text(pdfs):
     return text
 
 def convert_to_text_chunks(text, modelname):
-    if modelname == "Google AI":
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    if modelname == "Google_AI":
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100, separators=["\n\n", "\n", ".", " ", ""], length_function=len)
     else:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100, separators=["\n\n", "\n", ".", " ", ""], length_function=len)
     chunks = text_splitter.split_text(text)
     return chunks
 
 def get_vector_store(text_chunks, model_name):
     if model_name == "Google_AI":
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    docs = [Document(page_content=chunk) for chunk in text_chunks]
+    vector_store = FAISS.from_documents(docs, embeddings)
     vector_store.save_local(VECTOR_DB)
 
 def get_pdf_signature(pdf_docs):
-    return tuple((pdf.name, pdf.size) for pdf in pdf_docs)
+    hasher = hashlib.md5()
+    for pdf in pdf_docs:
+        hasher.update(pdf.getvalue())
+    return hasher.hexdigest()
 
-def get_conversational_chain(modelname, api_key=None):
+def get_conversational_chain(modelname, api_key):
     if modelname == "Google_AI":
 
         prompt_template = """
@@ -64,11 +76,30 @@ def get_conversational_chain(modelname, api_key=None):
         Answer:
         """
 
-        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3, google_api_key=api_key)
-        prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-        chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-        return chain
-    
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3, google_api_key=api_key, max_output_tokens=512)
+        prompt = ChatPromptTemplate.from_template(prompt_template)
+
+        document_chain = create_stuff_documents_chain(model, prompt)
+
+        return document_chain
+
+def safe_chain_invoke(chain, inputs, retries=3):
+    for i in range(retries):
+        try:
+            return chain.invoke(inputs)
+        except ResourceExhausted:
+            time.sleep(2 ** i)
+    raise Exception("Rate limit Exceeded")
+
+@st.cache_resource
+def load_embeddings():
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+@st.cache_resource
+def load_faiss():
+    embeddings = load_embeddings()
+    return FAISS.load_local(VECTOR_DB, embeddings, allow_dangerous_deserialization=True)
+
 def user_input(user_question, model_name, api_key, pdf_docs, conversation_history):
     if not st.session_state.get("vector_store_ready", False) :
         st.warning("Please upload and process PDFs first")
@@ -81,17 +112,31 @@ def user_input(user_question, model_name, api_key, pdf_docs, conversation_histor
         st.warning("Please upload PDF files")
 
     if model_name == "Google_AI":
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        new_db = FAISS.load_local(VECTOR_DB, embeddings, allow_dangerous_deserialization=True)
-        docs = new_db.similarity_search(user_question)
 
-        chain = get_conversational_chain("Google_AI", api_key=api_key)
-        response = chain.invoke({
-            "input_documents": docs,
-            "question": user_question
-        })
+        new_db = load_faiss()
+
+
+        docs_and_scores = new_db.similarity_search_with_score(user_question, k=5)
+
+        docs = [doc for doc, _ in docs_and_scores]
+
+        if not docs:
+            st.warning("No relevant context found in PDFs.")
+            return
         
-        response_output = response["output_text"]
+        chain = get_conversational_chain("Google_AI", api_key=api_key)
+
+        inputs = {
+            "context": docs,
+            "question": user_question
+        }
+
+        response = safe_chain_invoke(chain, inputs, retries=3)
+        
+        if isinstance(response, dict):
+            response_output = response.get("answer", "")
+        else:
+            response_output = response
 
         user_question_output = user_question
 
@@ -110,7 +155,7 @@ def delete_vector_db():
         shutil.rmtree(VECTOR_DB)
 
 def main():
-    st.set_page_config(page_title="Chat with multiple PDFs")
+    st.set_page_config(page_title="Chat with PDFs", layout="wide")
     st.header("📄 Chat with PDFs")
 
     # --- Initializing session state ---
@@ -211,7 +256,6 @@ def main():
         )
         st.session_state.user_question = ""
         
-
 if __name__ == "__main__":
     main()
 

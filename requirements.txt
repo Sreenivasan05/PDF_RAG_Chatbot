@@ -8,7 +8,6 @@ google-ai-generativelanguage
 langchain-community
 pandas
 langchain-huggingface
-
 faiss-cpu
 wikipedia
 sentence-transformers
