@@ -6,18 +6,26 @@ from rag.llm_chain import build_chain, safe_invoke
 
 
 def main():
-    st.set_page_config(page_title="Chat with PDFs", layout="wide")
-    st.header("📄 Chat with PDFs")
-
 
     if "pdf_sig" not in st.session_state:
         st.session_state.pdf_sig = None
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+
+    st.set_page_config(page_title="Chat with PDFs", layout="wide")
+    st.header("📄 Chat with PDFs")
 
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
 
     if not api_key:
             st.sidebar.warning("Please enter your Google API key")
             st.stop()
+
+    if st.sidebar.button("Clear Chat"):
+        st.session_state.chat_history = []
+
 
     uploaded = st.file_uploader("Upload PDFs", accept_multiple_files=True)
 
@@ -38,26 +46,53 @@ def main():
         else:
             st.info("Using existing embeddings")
 
-    # -- chat ---
+    # --- render chat history --- 
+    for q,a , sources in st.session_state.chat_history:
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("AI"):
+            st.markdown(a)
+        
+        if sources:
+            st.markdown("**Sources:**")
+            for s in sources:
+                st.markdown(f"- {s}")
 
-    query = st.text_input("Ask a question")
+    # -- chat ---
+    query = st.chat_input("Ask a question")
 
     if query and api_key:
-        docs = retrive_docs(query)
+        docs = retrive_docs(query=query)
 
         if not docs:
             st.warning("No relevant context found in PDF for this question")
 
         chain = build_chain(api_key)
 
+        with st.chat_message("user"):
+            st.markdown(query)
+
+        assistant_placeholder =  st.chat_message("assistant").empty()
+        assistant_placeholder.markdown("Thinking....")
+
         answer = safe_invoke(chain, {
             "context": docs,
             "question": query
         })
 
-        st.write(answer)
+        sources = {
+        f"{doc.metadata.get('source')} (page {doc.metadata.get('page')})"
+        for doc in docs
+        }
 
+        st.session_state.chat_history.append(
+            (query, answer, sources)
+        )
 
+        assistant_placeholder.markdown(answer)
+        st.markdown("**Sources:**")
+        for s in sorted(sources):
+            st.markdown(f"-{s}")
 
 if __name__ == "__main__":
     main()
