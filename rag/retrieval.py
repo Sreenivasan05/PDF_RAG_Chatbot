@@ -4,12 +4,9 @@ from langchain_community.vectorstores import FAISS
 
 
 
-def load_vector_store():
+
+def get_retriever():
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    return FAISS.load_local(VECTOR_DB, embeddings, allow_dangerous_deserialization=True)
+    db = FAISS.load_local(VECTOR_DB, embeddings, allow_dangerous_deserialization=True)
 
-
-def retrive_docs(query, k=5):
-    db = load_vector_store()
-    results = db.similarity_search(query, k=k)
-    return results
+    return db.as_retriever(search_kwargs={"k": 5})
